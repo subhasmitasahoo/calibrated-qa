@@ -1,0 +1,42 @@
+[project]
+name = "calibrated-qa"
+version = "0.1.0"
+description = "Teaching Qwen 2.5 to know what it doesn't know — a calibrated abstention post-training project."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "modal",
+    "torch",
+    "transformers",
+    "datasets",
+    "trl",
+    "unsloth",
+    "wandb",
+    "accelerate",
+    "peft",
+    "bitsandbytes",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "pytest",
+    "ipykernel",
+    "jupyter",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
