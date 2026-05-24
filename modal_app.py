@@ -92,6 +92,74 @@ def load_qwen():
     }
 
 
+@app.function(
+    gpu="A10G",
+    volumes={HF_CACHE_PATH: hf_cache},
+    timeout=600,
+)
+def qwen_chat(
+    questions: list[str],
+) -> list[str]:
+    """Run Qwen 2.5 0.5B on a list of factual questions. Returns a list of
+    dicts with the question, the raw response, and a few diagnostics."""
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    model_id = "Qwen/Qwen2.5-0.5B-Instruct"
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+
+    # Switch model to inference mode.
+    model.eval() # Disable dropout etc. — we're doing inference, not training.
+
+    # The system prompt nudges Qwen toward terse factual answers.
+    # We deliberately do NOT mention "I don't know" here — we want to see the
+    # *baseline* behavior. The whole project is about teaching this behavior later.
+    system_prompt = (
+        "You are a helpful assistant. Answer the user's question concisely — "
+        "ideally just the answer with no extra words."
+    )
+
+    results = []
+    for q in questions:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": q},
+        ]
+        prompt_text = tokenizer.apply_chat_template(messages, 
+        tokenize=False, # we want the string, will tokenize next
+        add_generation_prompt=True # crucial: appends the assistant cue
+        )
+
+        # Tokenize.
+        inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
+        prompt_length = inputs["input_ids"].shape[1] # number of tokens in the prompt
+        
+        # Generate. torch.inference_mode() disables gradient tracking — faster + less VRAM.
+        with torch.inference_mode():
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=64,
+                do_sample=False,           # greedy, for reproducible sanity check
+                pad_token_id=tokenizer.eos_token_id,  # silences a warning
+            )
+            # output_ids contains prompt tokens + generated tokens. Slice off the prompt
+            # so we only decode the *new* part.
+            new_tokens = output_ids[0, prompt_length:]
+            response = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+            results.append({
+                "question": q,
+                "response": response,
+                "prompt_tokens": prompt_length,
+                "response_tokens": len(response),
+            })
+    return results
+
 # A local_entrypoint runs on your laptop. It's how you trigger remote functions.
 # When you run `modal run modal_app.py`, this is what gets executed.
 @app.local_entrypoint()
@@ -106,3 +174,17 @@ def main():
     result = load_qwen.remote()
     print(f"Load duration: {result['load_duration_s']}s")
     print(result)
+
+    print("\n=== Chat test ===")
+    test_questions = [
+        "What is the capital of France?",
+        "Who wrote the novel 'Pride and Prejudice'?",
+        "What is the chemical symbol for gold?",
+        "Who was the 23rd president of Burkina Faso?",  # likely doesn't know
+        "What is the name of the fictional planet in the 2003 short story by Liang Wei?",  # almost certainly doesn't know — likely hallucinates
+    ]
+    results = qwen_chat.remote(test_questions)
+    for r in results:
+        print(f"\nQ: {r['question']}")
+        print(f"A: {r['response']}")
+        print(f"   ({r['prompt_tokens']} prompt tokens, {r['response_tokens']} response tokens)")
