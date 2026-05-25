@@ -159,3 +159,46 @@ out accuracy by subclass at eval time.
   loss curve. Today's run is infra validation, not a usable model.
 - Plausible failure mode: "abstain on everything" collapse, where the trained
   model says IDK to questions the base model knew. Will check at eval time.
+
+
+## 2026-05-25 — Stage 5: First SFT smoketest
+
+Trained Qwen 2.5 0.5B-Instruct on the v0 SFT dataset (58 train / 10 eval).
+LoRA on all linear projections (~8.8M trainable params, 1.75% of total — turned
+out to be more than I predicted; PEFT defaults included some additional layers).
+3 epochs, LR 2e-4 cosine, batch size 4, bf16.
+
+### Results
+
+- Train loss: 2.32 → 0.52 (~4x reduction).
+- Eval loss: dropped sharply in epoch 1, drifted UP through epochs 2-3.
+  Classic overfitting onset at this dataset size.
+- Train/eval gap at end: 0.52 / 0.90 — meaningful but not catastrophic.
+- Adapter saved at `adapters` volume `sft_v0_smoketest/`.
+- W&B: https://wandb.ai/.../runs/m68zfaqv
+
+### ⚠ Caveat: loss masking not verified
+
+Our pre-training sanity check warned "no 'labels' field in tokenized example."
+Investigation: TRL 0.12 with `messages` format does NOT apply completion-only
+loss masking by default. Need to set `assistant_only_loss=True` in SFTConfig
+explicitly. Likely this run trained on system+user tokens AS WELL AS assistant
+tokens.
+
+Mitigating factors:
+- System prompt is identical across all examples → near-zero gradient there
+  after a couple of examples.
+- Questions are diverse but short; bulk of token loss is still on assistant
+  response.
+- Loss curve shape suggests meaningful learning occurred regardless.
+
+Decision: proceed to Stage 6 (eval) with this adapter to see what it actually
+learned. If behavior is good → note caveat and move on. If poor → retrain with
+explicit masking and compare. Either is a useful experimental data point.
+
+### Lesson for the real run
+
+- Set `assistant_only_loss=True` explicitly.
+- Improve the sanity check to inspect a *collated batch* (post-collator),
+  not raw dataset items. Specifically: build a DataLoader from the trainer
+  and pull one batch; inspect `labels` there.

@@ -13,7 +13,12 @@ image = (
         "transformers==4.46.0",
         "accelerate==1.0.1",
         "huggingface_hub==0.26.0",
-        "datasets==3.0.1",  # new
+        "datasets==3.0.1",
+        # New for SFT:
+        "trl==0.12.0",
+        "peft==0.13.2",
+        "bitsandbytes==0.44.1",  # for 8-bit optimizers if needed
+        "wandb==0.18.5",
     )
 )
 
@@ -28,6 +33,8 @@ hf_cache = modal.Volume.from_name("hf-cache", create_if_missing=True)
 # We'll mount the volume at the default HF cache path so transformers finds it automatically.
 HF_CACHE_PATH = "/root/.cache/huggingface"
 
+adapters = modal.Volume.from_name("adapters", create_if_missing=True)
+ADAPTERS_PATH = "/root/adapters"
 
 # The @app.function decorator marks this function as something that runs on Modal,
 # not on your laptop. gpu="A10G" requests Modal's cheapest GPU (~$1.10/hr, billed per second).
@@ -269,6 +276,174 @@ def qwen_sample(
     return all_results
 
 
+
+@app.function(
+    gpu="A10G",
+    volumes={
+        HF_CACHE_PATH: hf_cache,
+        ADAPTERS_PATH: adapters,
+    },
+    secrets=[modal.Secret.from_name("wandb-secret")],
+    timeout=3600,  # 1 hour ceiling; real run is ~5 min
+)
+def sft_train(
+    run_name: str,
+    sft_data: list[dict],
+    eval_data: list[dict],
+    base_model: str = "Qwen/Qwen2.5-0.5B-Instruct",
+    num_epochs: int = 3,
+    learning_rate: float = 2e-4,
+    lora_r: int = 16,
+    lora_alpha: int = 32,
+    lora_dropout: float = 0.05,
+    batch_size: int = 4,
+):
+    """Fine-tune Qwen with LoRA via TRL's SFTTrainer.
+
+    Saves the adapter to /root/adapters/{run_name}/ on the `adapters` volume.
+    Logs training to W&B project 'calibrated-qa'.
+    """
+    import os
+    import torch
+    import wandb
+    from datasets import Dataset
+    from peft import LoraConfig, get_peft_model
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from trl import SFTConfig, SFTTrainer
+
+    # --- W&B setup ---
+    # The secret injected WANDB_API_KEY into the env. wandb.init picks it up.
+    wandb.init(
+        project="calibrated-qa",
+        name=run_name,
+        config={
+            "base_model": base_model,
+            "num_epochs": num_epochs,
+            "learning_rate": learning_rate,
+            "lora_r": lora_r,
+            "lora_alpha": lora_alpha,
+            "batch_size": batch_size,
+            "n_train": len(sft_data),
+            "n_eval": len(eval_data),
+        },
+    )
+
+    # --- Load model + tokenizer ---
+    print(f"Loading base model: {base_model}")
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
+    # Important: set pad token. Qwen's tokenizer has eos but no pad by default.
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+    )
+
+    # --- Apply LoRA ---
+    lora_config = LoraConfig(
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        bias="none",
+        target_modules=[
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+        ],
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
+    # Above prints something like:
+    # trainable params: 4,399,104 || all params: 498,431,872 || trainable%: 0.88
+
+    # --- Datasets ---
+    train_ds = Dataset.from_list(sft_data)
+    eval_ds = Dataset.from_list(eval_data)
+    print(f"Train: {len(train_ds)} examples | Eval: {len(eval_ds)} examples")
+
+    # --- TRL config ---
+    output_dir = f"{ADAPTERS_PATH}/{run_name}"
+    sft_config = SFTConfig(
+        output_dir=output_dir,
+        num_train_epochs=num_epochs,
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=batch_size,
+        gradient_accumulation_steps=1,
+        learning_rate=learning_rate,
+        lr_scheduler_type="cosine",
+        warmup_ratio=0.1,
+        logging_steps=2,
+        eval_strategy="epoch",  # evaluate at end of each epoch
+        save_strategy="epoch",  # checkpoint at end of each epoch
+        save_total_limit=1,     # keep only the most recent checkpoint
+        bf16=True,
+        report_to="wandb",
+        run_name=run_name,
+        # SFT-specific:
+        max_seq_length=512,
+        packing=False,           # don't pack; tiny dataset
+        dataset_text_field=None,  # use messages format
+        # completion_only_loss is automatically applied with messages format in TRL >=0.11
+    )
+
+    trainer = SFTTrainer(
+        model=model,
+        args=sft_config,
+        train_dataset=train_ds,
+        eval_dataset=eval_ds,
+        processing_class=tokenizer,  # newer TRL name for tokenizer
+    )
+
+    # --- Sanity check: peek at one tokenized example BEFORE training ---
+    # This is the verification step. We want to confirm loss masking is correct.
+    sample = trainer.train_dataset[0]
+    # If using messages format with completion-only loss, TRL adds a 'labels' field
+    # where non-assistant tokens are -100 (the ignore index for cross-entropy).
+    if "labels" in sample:
+        labels = sample["labels"]
+        input_ids = sample["input_ids"]
+        n_total = len(input_ids)
+        n_masked = sum(1 for l in labels if l == -100)
+        n_unmasked = n_total - n_masked
+        print(f"\n=== Loss masking sanity check ===")
+        print(f"Total tokens: {n_total}")
+        print(f"Masked (loss ignored): {n_masked}")
+        print(f"Unmasked (loss computed): {n_unmasked}")
+        # Decode unmasked tokens to see what we're training on
+        unmasked_ids = [i for i, l in zip(input_ids, labels) if l != -100]
+        unmasked_text = tokenizer.decode(unmasked_ids)
+        print(f"Tokens we compute loss on (decoded): {unmasked_text!r}")
+    else:
+        print("WARNING: no 'labels' field in tokenized example. Loss masking may not be applied.")
+
+    # --- Train ---
+    print("\n=== Starting training ===")
+    train_result = trainer.train()
+
+    # --- Save adapter ---
+    print(f"\nSaving adapter to {output_dir}")
+    trainer.save_model(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    adapters.commit()
+
+    # --- Final eval ---
+    eval_result = trainer.evaluate()
+    print(f"\nFinal eval: {eval_result}")
+
+    wandb.finish()
+
+    return {
+        "run_name": run_name,
+        "adapter_path": output_dir,
+        "train_loss_final": train_result.training_loss,
+        "eval_loss_final": eval_result["eval_loss"],
+        "n_train": len(train_ds),
+        "n_eval": len(eval_ds),
+    }
+
+
 # To run: modal run modal_app.py::probe_main
 @app.local_entrypoint()
 def probe_main():
@@ -356,3 +531,50 @@ def main():
         print(f"\nQ: {r['question']}")
         print(f"A: {r['response']}")
         print(f"   ({r['prompt_tokens']} prompt tokens, {r['response_tokens']} response tokens)")
+
+
+@app.local_entrypoint()
+def sft_main(
+    run_name: str = "sft_v0_smoketest",
+    eval_frac: float = 0.15,
+    epochs: int = 3,
+):
+    """Load SFT data locally, split train/eval, launch training on Modal."""
+    import json
+    import random
+    from pathlib import Path
+
+    # Load the SFT data we built in Stage 4
+    sft_path = Path("data/sft/sft_v0.jsonl")
+    examples = [json.loads(line) for line in sft_path.read_text().splitlines()]
+    print(f"Loaded {len(examples)} SFT examples")
+
+    # Stratified train/eval split: keep the knows/doesnt_know balance in eval
+    rng = random.Random(0)
+    rng.shuffle(examples)
+
+    knows = [e for e in examples if e["meta_label"] == "knows"]
+    doesnt = [e for e in examples if e["meta_label"] == "doesnt_know"]
+
+    n_eval_per_class = max(1, int(len(knows) * eval_frac))
+    eval_data = knows[:n_eval_per_class] + doesnt[:n_eval_per_class]
+    train_data = knows[n_eval_per_class:] + doesnt[n_eval_per_class:]
+
+    rng.shuffle(train_data)
+    rng.shuffle(eval_data)
+
+    print(f"Split: {len(train_data)} train ({len([e for e in train_data if e['meta_label']=='knows'])} knows / {len([e for e in train_data if e['meta_label']=='doesnt_know'])} doesnt_know)")
+    print(f"       {len(eval_data)} eval ({len([e for e in eval_data if e['meta_label']=='knows'])} knows / {len([e for e in eval_data if e['meta_label']=='doesnt_know'])} doesnt_know)")
+
+    # Strip metadata fields — TRL only needs `messages`
+    train_clean = [{"messages": e["messages"]} for e in train_data]
+    eval_clean = [{"messages": e["messages"]} for e in eval_data]
+
+    print(f"\nLaunching SFT on Modal: run_name={run_name}")
+    result = sft_train.remote(
+        run_name=run_name,
+        sft_data=train_clean,
+        eval_data=eval_clean,
+        num_epochs=epochs,
+    )
+    print(f"\nDone: {result}")
