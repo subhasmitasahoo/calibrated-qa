@@ -98,3 +98,64 @@ random TriviaQA (rc.nocontext) questions. Labeled via self-consistency:
 - Add `confident_wrong` flag to doesnt_know examples for later RL analysis.
 - For the real project, scale probe to 5k questions to get ~900 "knows" examples
   rather than discarding 110 "doesnt_know" to balance.
+
+==========================
+
+## 2026-05-25 — Stage 4: SFT dataset v0 (balanced 34+34, n=68)
+
+Built the first SFT dataset from probe_v0 using a balanced 1:1 split of knows
+vs doesnt_know.
+
+### Matcher v1: filter aliases < 3 chars + small stoplist
+
+Re-labeled the probe with a stricter alias matcher. Result:
+
+|              | v0 (loose) | v1 (filtered) | Δ   |
+|--------------|------------|---------------|-----|
+| knows        | 36         | 34            | -2  |
+| doesnt_know  | 146        | 148           | +2  |
+| borderline   | 18         | 18            |  0  |
+
+Only 3 label shifts on this 200-question slice, but the *direction* matters: both
+knows→doesnt_know. That is, the v0 matcher had **2 false-positive "knows"**
+(5.5% of the class) — questions where short-alias substrings (e.g. "jun", "5")
+accidentally matched unrelated text in model responses. Training on v0 labels
+would have taught the model to confidently emit those wrong answers ~5% of the
+time. Real cost of label noise in a small dataset.
+
+Takeaway: alias-substring matching introduces meaningful label noise. For the
+real run, plan to add (a) stricter alias filtering, (b) a brief LLM-judge pass
+on borderline matches, and (c) periodic manual audits of high-impact subsets.
+
+### Confidently-wrong subclass: 37 of 148 doesnt_know (25%)
+
+Flagged a new subclass — examples where all 5 samples were near-identical AND
+all wrong. Approximated via "first 20 chars of each sample are equal."
+
+25% of the "doesnt_know" pool falls in this bucket. Higher than I expected.
+These are examples where the model has a **strong wrong prior**, not genuine
+uncertainty (e.g. yesterday's "Point Barrow → Norway" 5/5 case).
+
+Hypothesis to test later: SFT should work fine on this subclass (we're just
+training the target output), but GRPO will plausibly struggle more here than
+on the genuinely-uncertain subclass — the policy distribution starts more
+sharply peaked on the wrong answer, so RL has to do more work. Worth breaking
+out accuracy by subclass at eval time.
+
+### Dataset construction
+
+- Balanced 34 knows + 34 doesnt_know = 68 examples.
+- Format: TRL `messages` (system / user / assistant), assistant content is
+  either the canonical answer or the literal string `"I don't know"`.
+- System prompt explicitly instructs the model to respond with "I don't know"
+  when not confident. (Without this hint, SFT would have to teach both the
+  behavior AND the surface form.)
+- Shuffled with seed 42 so train order isn't all-knows-then-all-IDK.
+- Output: `data/sft/sft_v0.jsonl`.
+
+### Caveats going into Stage 5
+
+- 68 examples is tiny by SFT standards. Expect rapid memorization and a steep
+  loss curve. Today's run is infra validation, not a usable model.
+- Plausible failure mode: "abstain on everything" collapse, where the trained
+  model says IDK to questions the base model knew. Will check at eval time.

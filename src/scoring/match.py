@@ -38,6 +38,34 @@ def is_match(response: str, aliases: list[str]) -> bool:
     return False
 
 
+# Common short English words that often appear as aliases but cause spurious matches.
+# Kept small; expand if you see specific false positives.
+_ALIAS_STOPLIST = {"the", "a", "an", "of", "in", "is", "to", "and", "or"}
+
+
+def filter_aliases(aliases: list[str], min_len: int = 4) -> list[str]:
+    """Drop aliases that are too short or are stopwords, after normalization.
+
+    Removes a class of false positives where short aliases (e.g. "jun" for
+    'June') match unintended substrings in model responses.
+    """
+    filtered = []
+    for alias in aliases:
+        norm = normalize(alias)
+        if len(norm) < min_len:
+            continue
+        if norm in _ALIAS_STOPLIST:
+            continue
+        filtered.append(alias)
+    return filtered
+
+
+def is_match_v1(response: str, aliases: list[str]) -> bool:
+    """Improved matcher: filters aliases before checking substring match."""
+    cleaned = filter_aliases(aliases)
+    return is_match(response, cleaned)
+
+
 # Quick self-test — run `python src/scoring/match.py` to verify.
 if __name__ == "__main__":
     cases = [
@@ -53,3 +81,16 @@ if __name__ == "__main__":
         got = is_match(response, aliases)
         status = "✓" if got == expected else "✗"
         print(f"{status} is_match({response!r}, {aliases}) = {got}, expected {expected}")
+
+    print("\n--- v1 matcher tests ---")
+    v1_cases = [
+        # (response, aliases, expected, note)
+        ("June 2023", ["jun", "June"], True, "should still match 'June'"),
+        ("junior employee", ["jun"], False, "v1 should drop 'jun', no false positive"),
+        ("Paris", ["Paris"], True, "normal case"),
+        ("It is a town", ["a"], False, "v1 should drop stopword 'a'"),
+    ]
+    for response, aliases, expected, note in v1_cases:
+        got = is_match_v1(response, aliases)
+        status = "✓" if got == expected else "✗"
+        print(f"{status} is_match_v1({response!r}, {aliases}) = {got}  // {note}")
