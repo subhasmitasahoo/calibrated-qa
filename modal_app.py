@@ -444,6 +444,97 @@ def sft_train(
     }
 
 
+@app.function(
+    gpu="A10G",
+    volumes={
+        HF_CACHE_PATH: hf_cache,
+        ADAPTERS_PATH: adapters,
+    },
+    timeout=1800,
+)
+def eval_model(
+    questions: list[dict],  # each: {"question": ..., "aliases": [...], "answer": ...}
+    adapter_path: str | None = None,
+    base_model: str = "Qwen/Qwen2.5-0.5B-Instruct",
+    temperature: float = 0.0,  # greedy for reproducibility
+    max_new_tokens: int = 64,
+) -> list[dict]:
+    """Run inference on a list of questions, optionally with a LoRA adapter loaded.
+
+    Returns per-example results with question, response, ground-truth match flag,
+    and an abstention flag. Scoring/aggregation happens locally.
+    """
+    import torch
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Load base model
+    print(f"Loading base model: {base_model}")
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+    )
+
+    # Optionally load adapter
+    if adapter_path:
+        print(f"Loading LoRA adapter: {adapter_path}")
+        model = PeftModel.from_pretrained(model, adapter_path)
+        # Optional: model = model.merge_and_unload() to fuse adapter into weights.
+        # We don't fuse — keeps the adapter swappable and avoids any rounding.
+
+    model.eval()
+
+    # Use the SAME system prompt we trained with, otherwise the trained model
+    # might not know it's "allowed" to abstain.
+    system_prompt = (
+        "You are a helpful assistant. Answer the user's question concisely — "
+        "ideally just the answer with no extra words. "
+        "If you do not know the answer with confidence, respond exactly with: I don't know."
+    )
+
+    results = []
+    for i, ex in enumerate(questions):
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": ex["question"]},
+        ]
+        prompt_text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
+        prompt_len = inputs["input_ids"].shape[1]
+
+        with torch.inference_mode():
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=(temperature > 0),
+                temperature=temperature if temperature > 0 else 1.0,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+
+        new_tokens = output_ids[0, prompt_len:]
+        response = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+
+        results.append({
+            "question": ex["question"],
+            "answer": ex["answer"],
+            "aliases": ex["aliases"],
+            "response": response,
+        })
+
+        if (i + 1) % 50 == 0:
+            print(f"  {i + 1}/{len(questions)} done")
+
+    return results
+
+
 # To run: modal run modal_app.py::probe_main
 @app.local_entrypoint()
 def probe_main():
@@ -578,3 +669,113 @@ def sft_main(
         num_epochs=epochs,
     )
     print(f"\nDone: {result}")
+
+
+@app.local_entrypoint()
+def eval_main(
+    n_questions: int = 200,
+    seed: int = 1337,  # different seed than the probe so we get fresh questions
+    adapter_path: str = "/root/adapters/sft_v0_smoketest",
+):
+    """Run base vs SFT-adapter eval on a held-out set; write results + summary."""
+    import json
+    import sys
+    from pathlib import Path
+    from collections import Counter
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    from src.scoring.match import is_match_v1, is_abstention
+
+    # --- Load fresh held-out questions (different seed from probe) ---
+    print(f"Loading {n_questions} held-out TriviaQA questions (seed={seed})...")
+    held_out = load_trivia.remote(n=n_questions, seed=seed)
+
+    # --- Evaluate BASE model ---
+    print("\n=== Evaluating BASE Qwen 2.5 0.5B ===")
+    base_results = eval_model.remote(held_out, adapter_path=None)
+
+    # --- Evaluate SFT model ---
+    print("\n=== Evaluating SFT-adapted Qwen 2.5 0.5B ===")
+    sft_results = eval_model.remote(held_out, adapter_path=adapter_path)
+
+    # --- Score both locally ---
+    def score(results):
+        rows = []
+        for ex in results:
+            abstained = is_abstention(ex["response"])
+            correct = is_match_v1(ex["response"], ex["aliases"]) if not abstained else False
+            rows.append({
+                **ex,
+                "abstained": abstained,
+                "correct": correct,
+            })
+        n = len(rows)
+        n_abstain = sum(r["abstained"] for r in rows)
+        n_answered = n - n_abstain
+        n_correct = sum(r["correct"] for r in rows)  # only counts non-abstained correct
+        n_wrong_confident = sum(1 for r in rows if not r["abstained"] and not r["correct"])
+
+        return {
+            "rows": rows,
+            "n": n,
+            "abstain_rate": n_abstain / n,
+            "answer_rate": n_answered / n,
+            "accuracy_overall": n_correct / n,                    # of all questions
+            "accuracy_when_answering": n_correct / n_answered if n_answered else 0.0,
+            "hallucination_rate": n_wrong_confident / n,
+            "composite": (n_correct / n_answered if n_answered else 0.0) - (n_wrong_confident / n),
+        }
+
+    base_score = score(base_results)
+    sft_score = score(sft_results)
+
+    # --- Print comparison table ---
+    metrics = [
+        ("abstain_rate", "Abstention rate"),
+        ("answer_rate", "Answer attempt rate"),
+        ("accuracy_overall", "Accuracy (overall)"),
+        ("accuracy_when_answering", "Accuracy when answering"),
+        ("hallucination_rate", "Hallucination rate"),
+        ("composite", "Composite (acc_when_ans − halluc_rate)"),
+    ]
+    print(f"\n{'Metric':<40} {'BASE':>10} {'SFT':>10} {'Δ':>10}")
+    print("-" * 72)
+    for key, label in metrics:
+        b, s = base_score[key], sft_score[key]
+        delta = s - b
+        print(f"{label:<40} {b:>10.3f} {s:>10.3f} {delta:>+10.3f}")
+
+    # --- Save per-example results ---
+    out_dir = Path("data/eval")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / "eval_v0_base.jsonl", "w") as f:
+        for row in base_score["rows"]:
+            f.write(json.dumps(row) + "\n")
+    with open(out_dir / "eval_v0_sft.jsonl", "w") as f:
+        for row in sft_score["rows"]:
+            f.write(json.dumps(row) + "\n")
+
+    # --- Save summary ---
+    summary = {
+        "n_questions": n_questions,
+        "seed": seed,
+        "adapter_path": adapter_path,
+        "base": {k: base_score[k] for k, _ in metrics},
+        "sft": {k: sft_score[k] for k, _ in metrics},
+    }
+    with open(out_dir / "eval_v0_summary.json", "w") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"\nWrote eval data to {out_dir}/")
+    print("\n=== 5 random where SFT differs from BASE ===")
+    import random
+    diffs = []
+    for b, s in zip(base_score["rows"], sft_score["rows"]):
+        if (b["correct"], b["abstained"]) != (s["correct"], s["abstained"]):
+            diffs.append((b, s))
+    print(f"Total examples where behavior changed: {len(diffs)}")
+    for b, s in random.Random(0).sample(diffs, min(5, len(diffs))):
+        print(f"\nQ: {b['question']}")
+        print(f"  truth: {b['answer']}")
+        print(f"  BASE:  {b['response'][:120]}  [correct={b['correct']}, abstain={b['abstained']}]")
+        print(f"  SFT:   {s['response'][:120]}  [correct={s['correct']}, abstain={s['abstained']}]")

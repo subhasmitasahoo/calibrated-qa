@@ -202,3 +202,125 @@ explicit masking and compare. Either is a useful experimental data point.
 - Improve the sanity check to inspect a *collated batch* (post-collator),
   not raw dataset items. Specifically: build a DataLoader from the trainer
   and pull one batch; inspect `labels` there.
+
+
+===================
+
+## 2026-05-25 — Stage 6: Held-out eval — SFT collapsed to indiscriminate abstention
+
+Evaluated base Qwen 2.5 0.5B vs base+SFT-adapter on 200 held-out TriviaQA
+questions (seed 1337, distinct from probe seed). Greedy decoding.
+
+### Results
+
+| Metric                          | BASE   | SFT    | Δ        |
+|---------------------------------|--------|--------|----------|
+| Abstention rate                 | 0.060  | 0.950  | +0.890   |
+| Answer attempt rate             | 0.940  | 0.050  | −0.890   |
+| Accuracy (overall)              | 0.190  | 0.005  | −0.185   |
+| Accuracy when answering         | 0.202  | 0.100  | −0.102   |
+| Hallucination rate              | 0.750  | 0.045  | −0.705   |
+| Composite (acc_ans − halluc)    | −0.548 | +0.055 | +0.603   |
+
+### Interpretation
+
+This is the "abstain-on-everything" collapse, pre-registered as the most-likely
+failure mode in the Stage 5 entry. The model learned to say "I don't know" to
+~95% of questions, including ones the base model demonstrably could answer
+(e.g. "Battle of Sharpsburg → Antietam", "largest Nazi camp → Auschwitz"). Of
+200 held-out questions, behavior differed on 179 — and in every spot-checked
+case, the SFT model abstained where the base attempted.
+
+### Why the composite metric "improved"
+
+Composite went from −0.55 to +0.06, but this is a degenerate optimum: a model
+that says IDK to everything trivially gets composite ≈ 0 (no answers, no
+hallucinations). The metric is correctly computing what we asked it to; we
+asked for the wrong thing. Real-world example of metric goodharting at small
+scale.
+
+### Causal story (likely contributing factors, ranked)
+
+1. **Dataset scale.** 58 examples is far too few to learn a *boundary* between
+   knows/doesnt-know. Easier to learn "always abstain." Even with perfect
+   training conditions, this collapse is expected at this scale.
+2. **Directive system prompt.** "If you do not know with confidence, respond
+   exactly with: I don't know" biases hard toward abstention. With a tiny SFT
+   set, the model latches onto this rather than learning a knowledge boundary.
+3. **Masking caveat (Stage 5).** Training loss likely included system-prompt
+   tokens, which would amplify the model's tendency to mirror the prompt's
+   "default to IDK" framing.
+
+### Decisions
+
+- **Do not retrain at this scale.** Collapse is a data-scale failure; rerunning
+  with masking fixed will likely produce a less severe but qualitatively
+  similar collapse. Better to move to Stage 7 (GRPO) and exercise the full
+  pipeline, then attack data scale + masking together in the "real run."
+- **For the real run:**
+  - Probe ≥3000 questions to yield 600+ "knows" examples (vs 36 here).
+  - Fix masking: `assistant_only_loss=True` in `SFTConfig`.
+  - Softer system prompt that *describes* the calibration goal rather than
+    instructing the exact output string.
+  - Replace composite metric. Candidate: `accuracy_overall − α × halluc_rate`
+    (would have correctly penalized this run, since overall accuracy crashed).
+  - Add early stopping on eval loss (would have stopped after epoch 1 here).
+
+### What we still learned
+
+- Full SFT pipeline works end-to-end: probe → label → format → train → save
+  adapter → load → eval. Hours: ~3. Cost: ~$2.
+- Pre-registered the failure mode (Stage 5 entry, "abstain-on-everything") and
+  it materialized as predicted. Calibration of our priors is in good shape.
+- Built a reusable eval harness with per-example records, abstention
+  detection, and a comparison-table summary.
+
+## Sample output:
+
+Metric                                         BASE        SFT          Δ
+------------------------------------------------------------------------
+Abstention rate                               0.060      0.950     +0.890
+Answer attempt rate                           0.940      0.050     -0.890
+Accuracy (overall)                            0.190      0.005     -0.185
+Accuracy when answering                       0.202      0.100     -0.102
+Hallucination rate                            0.750      0.045     -0.705
+Composite (acc_when_ans − halluc_rate)       -0.548      0.055     +0.603
+
+Wrote eval data to data/eval/
+
+=== 5 random where SFT differs from BASE ===
+Total examples where behavior changed: 179
+
+Q: Which 1988 comedy film features a jewel robbery by a team of four, including an animal 
+lover with a stutter and a stupid idiot who resents being called that?
+  truth: 'A FISH CALLED WANDA'
+  BASE:  The 1988 comedy film featuring a jewel robbery is "Jewel in the Crown." It 
+includes a team of four, an animal lover with  [correct=False, abstain=False]
+  SFT:   I don't know  [correct=False, abstain=True]
+
+Q: What is the alternative name of The Battle of Sharpsburg fought on 17th Septermber 
+1862, the bloodiest single day in the US Civil War, with 22,717 dead wounded or missing?
+  truth: Antietam
+  BASE:  The Battle of Sharpsburg was also known as the Battle of Antietam.  
+[correct=True, abstain=False]
+  SFT:   I don't know  [correct=False, abstain=True]
+
+Q: She trained as a goldsmith, has been a film actress, and a lead and solo singer with 
+international and European hits under what name?
+  truth: Nena
+  BASE:  Linda Ronstadt  [correct=False, abstain=False]
+  SFT:   I don't know  [correct=False, abstain=True]
+
+Q: In the grounds of which house is the Emperor Fountain?
+  truth: Chatsworth
+  BASE:  The Emperor Fountain is located in the grounds of Buckingham Palace.  
+[correct=False, abstain=False]
+  SFT:   I don't know  [correct=False, abstain=True]
+
+Q: What was the largest concentration camp formed by the Nazis in World War 11
+  truth: Auschwitz
+  BASE:  The largest concentration camp formed by the Nazis during World War 11 was 
+Auschwitz-Birkenau.  [correct=True, abstain=False]
+  SFT:   I don't know  [correct=False, abstain=True]
+
+  

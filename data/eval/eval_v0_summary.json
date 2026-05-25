@@ -1,0 +1,21 @@
+{
+  "n_questions": 200,
+  "seed": 1337,
+  "adapter_path": "/root/adapters/sft_v0_smoketest",
+  "base": {
+    "abstain_rate": 0.06,
+    "answer_rate": 0.94,
+    "accuracy_overall": 0.19,
+    "accuracy_when_answering": 0.20212765957446807,
+    "hallucination_rate": 0.75,
+    "composite": -0.5478723404255319
+  },
+  "sft": {
+    "abstain_rate": 0.95,
+    "answer_rate": 0.05,
+    "accuracy_overall": 0.005,
+    "accuracy_when_answering": 0.1,
+    "hallucination_rate": 0.045,
+    "composite": 0.05500000000000001
+  }
+}

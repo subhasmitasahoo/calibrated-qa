@@ -66,6 +66,33 @@ def is_match_v1(response: str, aliases: list[str]) -> bool:
     return is_match(response, cleaned)
 
 
+# Abstention markers — strings that, if found in a normalized response, count as IDK.
+# Conservative list: we want clear refusals, not hedges that still attempt an answer.
+_ABSTENTION_MARKERS = [
+    "i don t know",        # "I don't know" -> normalized
+    "i do not know",
+    "don t know",          # "[I] don't know" without leading "i"
+    "no idea",
+    "not sure",
+    "i m not sure",        # "I'm not sure"
+    "unable to answer",
+    "cannot answer",
+    "can t answer",
+    "uncertain",
+]
+
+
+def is_abstention(response: str) -> bool:
+    """True if the response looks like an explicit refusal/IDK rather than an answer attempt.
+
+    Substring check over a markers list, on the normalized response. Conservative —
+    we only count clear refusal language, not soft hedges like "probably X" or
+    "if I recall correctly".
+    """
+    norm = normalize(response)
+    return any(marker in norm for marker in _ABSTENTION_MARKERS)
+
+
 # Quick self-test — run `python src/scoring/match.py` to verify.
 if __name__ == "__main__":
     cases = [
@@ -94,3 +121,17 @@ if __name__ == "__main__":
         got = is_match_v1(response, aliases)
         status = "✓" if got == expected else "✗"
         print(f"{status} is_match_v1({response!r}, {aliases}) = {got}  // {note}")
+    
+    print("\n--- abstention tests ---")
+    abstention_cases = [
+        ("I don't know.", True),
+        ("I don't know the exact name.", True),  # known limitation: hedge-then-answer also counts
+        ("Paris", False),
+        ("I'm not sure, but it might be Paris", True),
+        ("Probably Paris.", False),
+        ("idk", False),  # not in our list — accepted limitation
+    ]
+    for response, expected in abstention_cases:
+        got = is_abstention(response)
+        status = "✓" if got == expected else "✗"
+        print(f"{status} is_abstention({response!r}) = {got}, expected {expected}")
